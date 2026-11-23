@@ -29,7 +29,7 @@ class Fail {
 
 const blank = (s: string): boolean => s.trim() === '';
 
-function patchLines(text: string): string[] {
+export function patchLines(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n');
   if (text.endsWith('\n')) lines.pop();
@@ -38,6 +38,129 @@ function patchLines(text: string): string[] {
 
 function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+}
+
+// ---------------------------------------------------------------------------
+// M2 — matcher 3 tier + primitif baris/file (SPEC sections 3 and 5).
+// Not wired to the CLI yet: no format uses these until M3. The CLI behaviour
+// below is unchanged by this section.
+// ---------------------------------------------------------------------------
+
+/** A file's line break (S3-04): CRLF when its first line feed follows a carriage return, LF otherwise. */
+export function detectBreak(text: string): '\r\n' | '\n' {
+  const nl = text.indexOf('\n');
+  return nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+}
+
+export interface FileLines {
+  lines: string[];
+  br: '\r\n' | '\n';
+  final: boolean;
+}
+
+/** A file's lines (S3-05, S3-06, S3-07): its text split at its break; the last, empty piece after a final break is not a line. */
+export function splitFileLines(text: string): FileLines {
+  if (text === '') return { lines: [], br: '\n', final: false };
+  const br = detectBreak(text);
+  const parts = text.split(br);
+  const final = text.endsWith(br);
+  if (final) parts.pop();
+  return { lines: parts, br, final };
+}
+
+/** A changed file written back (S3-08): its own break between its lines, and a final one exactly when it ended with one. */
+export function joinFileLines(lines: string[], br: '\r\n' | '\n', final: boolean): string {
+  if (lines.length === 0) return '';
+  return lines.join(br) + (final ? br : '');
+}
+
+const stripTrailingWs = (s: string): string => s.replace(/[ \t]+$/, '');
+const stripBothWs = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+const leadingWs = (s: string): string => (s.match(/^[ \t]*/) ?? [''])[0]!;
+
+export interface Occurrences {
+  tier: 0 | 1 | 2;
+  positions: number[];
+}
+
+/**
+ * Where O occurs in lines (S5-01, S5-02, S5-03, S5-04, S5-05, S5-07, S5-08):
+ * the first of three tiers at which it occurs at least once. Tier 0: every
+ * line equal. Tier 1: equal once trailing spaces and tabs are removed from
+ * both. Tier 2: equal once leading and trailing spaces and tabs are removed
+ * from both. Occurrences may overlap. With --strict only tier 0 is tried
+ * (S5-06). Null when O occurs at no tier (S5-07), and for empty O: an empty
+ * old block is an insertion, matched by the format, not by this matcher.
+ */
+export function findOccurrences(O: string[], lines: string[], strict: boolean): Occurrences | null {
+  if (O.length === 0) return null;
+  const norms: ((s: string) => string)[] = [(s) => s, stripTrailingWs, stripBothWs];
+  const maxTier = strict ? 0 : 2;
+  for (let tier = 0; tier <= maxTier; tier++) {
+    const norm = norms[tier]!;
+    const want = O.map(norm);
+    const positions: number[] = [];
+    for (let i = 0; i + O.length <= lines.length; i++) {
+      let ok = true;
+      for (let j = 0; j < O.length; j++) {
+        if (norm(lines[i + j]!) !== want[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) positions.push(i);
+    }
+    if (positions.length > 0) return { tier: tier as 0 | 1 | 2, positions };
+  }
+  return null;
+}
+
+export type EmptyPReading = 'literal' | 'conservative';
+
+/**
+ * At tier 2 every other line of N is re-indented (S5-12): F is the leading
+ * spaces and tabs of the file's first matched line, P those of O's first
+ * line; a line of N that is not empty and not only whitespace, and starts
+ * with P, has that P replaced by F; any other line is written as it is.
+ *
+ * Ambiguity A16 (P empty): 'literal' reads the sentence mechanically — every
+ * non-empty line starts with the empty prefix, so every such line gets F
+ * prepended. 'conservative' re-indents only when P is non-empty. The caller
+ * picks; M2 implements both and does not decide.
+ */
+export function reindentTier2(N: string[], O: string[], fileLines: string[], pos: number, emptyP: EmptyPReading): string[] {
+  const F = leadingWs(fileLines[pos] ?? '');
+  const P = leadingWs(O[0] ?? '');
+  if (P === '' && emptyP === 'conservative') return [...N];
+  return N.map((l) => {
+    if (l === '' || l.trim() === '') return l;
+    if (!l.startsWith(P)) return l;
+    return F + l.slice(P.length);
+  });
+}
+
+/**
+ * Replace the k matched lines with N (S5-10, S5-11, S5-13). `contextOf` is
+ * aligned with N: the index into O of the file line a context line stands
+ * for, or null. A context line is written as the file's own matched line,
+ * never the patch's (S5-11). At tiers 0 and 1 the lines of N are written as
+ * they are; at tier 2 they are re-indented first (S5-12, S5-13).
+ */
+export function applyReplacement(
+  lines: string[],
+  pos: number,
+  O: string[],
+  N: string[],
+  tier: 0 | 1 | 2,
+  contextOf: (number | null)[],
+  emptyP: EmptyPReading,
+): string[] {
+  const reindented = tier === 2 ? reindentTier2(N, O, lines, pos, emptyP) : [...N];
+  const resolved = reindented.map((l, j) => {
+    const at = contextOf[j];
+    return at === null || at === undefined ? l : lines[pos + at]!;
+  });
+  return [...lines.slice(0, pos), ...resolved, ...lines.slice(pos + O.length)];
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -229,13 +352,19 @@ function run(args: string[]): { code: number; out: string[] } {
 }
 
 
-const trialEnv = process.env.MAKEFUN_ENV_URL;
-if (trialEnv !== undefined && trialEnv !== '') {
-  // A trial: the kit's runner reads the checks from the env and runs this file on each one, without this variable.
-  const { runTrial } = await import('./runner.ts');
-  await runTrial(trialEnv);
-} else {
-  const r = run(process.argv.slice(2));
-  writeSync(1, r.out.map((l) => `${l}\n`).join(''));
-  process.exitCode = r.code;
+// Only run the CLI when this file is the program being run, not when a test
+// imports its functions: `node main.ts` (directly, or spawned by runner.ts /
+// a trial) has main.ts as argv[1]; an importer's argv[1] is the test file.
+const invokedAsMain = typeof process.argv[1] === 'string' && process.argv[1].endsWith('main.ts');
+if (invokedAsMain) {
+  const trialEnv = process.env.MAKEFUN_ENV_URL;
+  if (trialEnv !== undefined && trialEnv !== '') {
+    // A trial: the kit's runner reads the checks from the env and runs this file on each one, without this variable.
+    const { runTrial } = await import('./runner.ts');
+    await runTrial(trialEnv);
+  } else {
+    const r = run(process.argv.slice(2));
+    writeSync(1, r.out.map((l) => `${l}\n`).join(''));
+    process.exitCode = r.code;
+  }
 }
