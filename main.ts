@@ -41,6 +41,350 @@ function safe(p: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// M3a — unified diffs (SPEC section 6): parser + applier.
+// ---------------------------------------------------------------------------
+
+/** One body line of a hunk (S6-15): context, old, or new; `backslashAfter` when a `\` line follows it (S6-28). */
+export interface UnifiedBodyLine {
+  kind: 'context' | 'old' | 'new';
+  text: string;
+  backslashAfter: boolean;
+}
+
+export interface UnifiedHunk {
+  /** Old start line A (1-based) from the hunk header; B and D are not used (S6-14). */
+  a: number;
+  body: UnifiedBodyLine[];
+}
+
+export interface UnifiedSection {
+  /** Old path, or null for /dev/null (no file). */
+  oldPath: string | null;
+  /** New path, or null for /dev/null (no file). */
+  newPath: string | null;
+  newFileMode: boolean;
+  deletedFileMode: boolean;
+  hunks: UnifiedHunk[];
+}
+
+/** What kind of edit a section is (S6-19..S6-22). */
+export function sectionKind(s: UnifiedSection): 'create' | 'delete' | 'move' | 'change' {
+  if (s.oldPath === null || s.newFileMode) return 'create';
+  if (s.newPath === null || s.deletedFileMode) return 'delete';
+  if (s.oldPath !== s.newPath) return 'move';
+  return 'change';
+}
+
+const DIFF_GIT_RE = /^diff --git a\/(\S+) b\/(\S+)$/;
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?=$|)/;
+
+/**
+ * Collect a hunk body starting at lines[start] (S6-15, S6-16). Returns the
+ * classified body lines and the index of the first line after the body. A
+ * body ends at the first line that is not a body line, a `diff --git ` line,
+ * a `--- ` + `+++ ` pair, or a `@@` line. Trailing zero-length lines are
+ * stripped; a ` ` (space-only) line is a context line and is kept.
+ */
+function collectBody(lines: string[], start: number): { body: UnifiedBodyLine[]; next: number } {
+  const raw: string[] = [];
+  let i = start;
+  while (i < lines.length) {
+    const l = lines[i]!;
+    if (l.startsWith('diff --git ')) break;
+    if (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
+    if (l.startsWith('@@')) break;
+    if (l === '' || l.startsWith(' ') || l.startsWith('-') || l.startsWith('+') || l.startsWith('\\')) {
+      raw.push(l);
+      i++;
+      continue;
+    }
+    break;
+  }
+  while (raw.length > 0 && raw[raw.length - 1] === '') raw.pop();
+  const body: UnifiedBodyLine[] = [];
+  for (const l of raw) {
+    if (l.startsWith('\\')) {
+      const prev = body[body.length - 1];
+      if (prev) prev.backslashAfter = true;
+      continue;
+    }
+    body.push({
+      kind: l === '' || l[0] === ' ' ? 'context' : l[0] === '-' ? 'old' : 'new',
+      text: l === '' ? '' : l.slice(1),
+      backslashAfter: false,
+    });
+  }
+  return { body, next: i };
+}
+
+/** A `--- ` / `+++ ` path (S6-03, S6-04, S6-06): after the four characters, up to the first tab, surrounding spaces removed, one leading a/ or b/ removed; /dev/null means no file (S6-05). */
+function parseHeaderPath(raw: string): string | null {
+  let p = raw.split('\t', 1)[0]!.trim();
+  if (p.startsWith('a/')) p = p.slice(2);
+  else if (p.startsWith('b/')) p = p.slice(2);
+  if (p === '/dev/null') return null;
+  return p;
+}
+
+interface SectionDraft extends UnifiedSection {
+  oldNamedBy: 'pair' | 'rename' | 'git' | null;
+  newNamedBy: 'pair' | 'rename' | 'git' | null;
+}
+
+/**
+ * Parse a unified patch into sections (S6-01..S6-13). Throws Exit2 on parse
+ * errors, with the 1-based line the format's section names. Hunk bodies are
+ * collected by parseHunkBody below (M3a batch 3); this pass handles section
+ * starts and headers.
+ */
+export function parseUnified(lines: string[]): UnifiedSection[] {
+  const sections: UnifiedSection[] = [];
+  let cur: SectionDraft | null = null;
+  // A section is "in its header" while it has no hunks yet (S6-02).
+  const inHeader = (): boolean => cur !== null && cur.hunks.length === 0;
+  const startSection = (oldPath: string | null, newPath: string | null, namedBy: 'git' | 'pair'): SectionDraft => {
+    const s: SectionDraft = {
+      oldPath, newPath, newFileMode: false, deletedFileMode: false, hunks: [],
+      oldNamedBy: namedBy, newNamedBy: namedBy,
+    };
+    sections.push(s);
+    cur = s;
+    return s;
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const n = i + 1; // 1-based line number
+    if (line.startsWith('diff --git ')) {
+      const m = DIFF_GIT_RE.exec(line);
+      if (!m) throw new Exit2(`error: parse ${n}`);
+      startSection(m[1]!, m[2]!, 'git');
+      i++;
+      continue;
+    }
+    if (line.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
+      const oldP = parseHeaderPath(line.slice(4));
+      const newP = parseHeaderPath(lines[i + 1]!.slice(4));
+      if (cur !== null && inHeader()) {
+        // The pair is part of this section's header (S6-01); it names the paths.
+        cur.oldPath = oldP;
+        cur.newPath = newP;
+        cur.oldNamedBy = 'pair';
+        cur.newNamedBy = 'pair';
+      } else {
+        startSection(oldP, newP, 'pair');
+      }
+      i += 2;
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      if (cur === null) throw new Exit2(`error: parse ${n}`);
+      const m = HUNK_RE.exec(line);
+      if (!m) throw new Exit2(`error: parse ${n}`);
+      const { body, next } = collectBody(lines, i + 1);
+      cur.hunks.push({ a: Number(m[1]!), body });
+      i = next;
+      continue;
+    }
+    if (cur !== null && inHeader()) {
+      if (line.startsWith('--- ')) {
+        // A `--- ` line not followed by a `+++ ` line, inside a section's header (S6-11).
+        throw new Exit2(`error: parse ${n + 1}`);
+      }
+      if (line.startsWith('+++ ')) {
+        // A lone `+++ ` line names the new path when no pair does.
+        if (cur.newNamedBy !== 'pair') {
+          cur.newPath = parseHeaderPath(line.slice(4));
+          cur.newNamedBy = 'pair';
+        }
+        i++;
+        continue;
+      }
+      if (line.startsWith('rename from ')) {
+        if (cur.oldNamedBy !== 'pair') {
+          cur.oldPath = line.slice('rename from '.length).trim();
+          cur.oldNamedBy = 'rename';
+        }
+        i++;
+        continue;
+      }
+      if (line.startsWith('rename to ')) {
+        if (cur.newNamedBy !== 'pair') {
+          cur.newPath = line.slice('rename to '.length).trim();
+          cur.newNamedBy = 'rename';
+        }
+        i++;
+        continue;
+      }
+      if (line.startsWith('new file mode')) {
+        cur.newFileMode = true;
+        i++;
+        continue;
+      }
+      if (line.startsWith('deleted file mode')) {
+        cur.deletedFileMode = true;
+        i++;
+        continue;
+      }
+      // `index`, `old mode`, `new mode`, `similarity index`,
+      // `dissimilarity index`, `Index:` and any other line are ignored (S6-10).
+      i++;
+      continue;
+    }
+    // Outside a section's header: lines that are not part of a section header
+    // are ignored (S6-17) — prose, code fences, and (until batch 3) hunk lines.
+    i++;
+  }
+  return sections;
+}
+
+/** O and N of a hunk, with N's context alignment (S6-24): O = context + old lines, N = context + new lines; contextOf[k] is the index into O of N[k] when N[k] is a context line, null when N[k] is a `+` line. */
+export function hunkON(hunk: UnifiedHunk): { O: string[]; N: string[]; contextOf: (number | null)[] } {
+  const O: string[] = [];
+  const N: string[] = [];
+  const contextOf: (number | null)[] = [];
+  for (const b of hunk.body) {
+    if (b.kind === 'context') {
+      contextOf.push(O.length);
+      O.push(b.text);
+      N.push(b.text);
+    } else if (b.kind === 'old') {
+      O.push(b.text);
+    } else {
+      N.push(b.text);
+      contextOf.push(null);
+    }
+  }
+  return { O, N, contextOf };
+}
+
+/** The last context or `+` line of a hunk body, or null (S6-28/S6-29 name only those lines; a `\` after a `-` line does not count — see A2). */
+function lastContextOrNew(hunk: UnifiedHunk): UnifiedBodyLine | null {
+  for (let k = hunk.body.length - 1; k >= 0; k--) {
+    const b = hunk.body[k]!;
+    if (b.kind === 'context' || b.kind === 'new') return b;
+  }
+  return null;
+}
+
+/**
+ * Apply one hunk to a file's lines (S6-23..S6-29). O non-empty: the occurrence
+ * of O nearest to A-1+d, ties to the earlier one (S6-25); no occurrence is a
+ * no-match (S6-26) — thrown as `error: no-match` without a path, the caller
+ * (section edit) adds the path. O empty: insert N after the first A+d lines,
+ * clamped to [0, lines.length] (S6-27). The returned d is the cumulative
+ * delta after this hunk (N.length - O.length added). Final break: when the
+ * matched lines run to EOF, or an insertion lands at the end, the file ends
+ * with a break unless `\` follows the hunk's last context or `+` line
+ * (S6-28/S6-29); otherwise the break is unchanged. Context lines are written
+ * as the file's own lines and tier-2 re-indent is literal (A16), both via
+ * applyReplacement (S5-11, S5-12). For an insertion there is no match, hence
+ * no tier: `+` lines are written as they are.
+ */
+export function applyUnifiedHunk(
+  state: { lines: string[]; br: '\r\n' | '\n'; final: boolean },
+  hunk: UnifiedHunk,
+  d: number,
+  strict: boolean,
+): { lines: string[]; br: '\r\n' | '\n'; final: boolean; d: number } {
+  const { O, N, contextOf } = hunkON(hunk);
+  const { lines, br } = state;
+  let final = state.final;
+  const newD = d + N.length - O.length;
+  if (O.length > 0) {
+    const occ = findOccurrences(O, lines, strict);
+    if (occ === null) throw new Exit2('error: no-match');
+    const target = hunk.a - 1 + d;
+    let best = occ.positions[0]!;
+    for (const p of occ.positions) {
+      if (Math.abs(p - target) < Math.abs(best - target)) best = p;
+    }
+    const newLines = applyReplacement(lines, best, O, N, occ.tier, contextOf, 'literal');
+    if (best + O.length === lines.length) {
+      const last = lastContextOrNew(hunk);
+      final = last === null || !last.backslashAfter;
+    }
+    return { lines: newLines, br, final, d: newD };
+  }
+  const pos = Math.max(0, Math.min(hunk.a + d, lines.length));
+  const newLines = applyReplacement(lines, pos, [], N, 0, contextOf, 'literal');
+  if (pos === lines.length && N.length > 0) {
+    const last = lastContextOrNew(hunk);
+    final = last === null || !last.backslashAfter;
+  }
+  return { lines: newLines, br, final, d: newD };
+}
+
+/**
+ * Build one Edit per section (S6-18): each section is one edit, applied in
+ * order; a section whose hunks all succeed changes the tree, a section that
+ * fails leaves it untouched (run() also snapshots per edit, S10-02).
+ */
+export function unifiedEdits(lines: string[], strict: boolean): Edit[] {
+  const sections = parseUnified(lines);
+  return sections.map((s) => (tree) => unifiedSectionEdit(tree, s, strict));
+}
+
+function unifiedSectionEdit(tree: Tree, s: UnifiedSection, strict: boolean): void {
+  const kind = sectionKind(s);
+  const oldP = s.oldPath;
+  const newP = s.newPath;
+  // Safety first (S10-02): named paths are checked before existence checks.
+  if (oldP !== null && !safe(oldP)) throw new Fail('unsafe', oldP);
+  if (newP !== null && !safe(newP)) throw new Fail('unsafe', newP);
+  if (kind === 'create') {
+    // Both paths /dev/null names no file: nothing to create.
+    if (newP === null) return;
+    if (tree.get(newP) !== null) throw new Fail('exists', newP);
+    // A20: context and `-` lines in a creation hunk are ignored; the file is
+    // the `+` lines of all hunks, line break LF, final break unless `\`
+    // follows the last `+` line.
+    const plus: string[] = [];
+    let final = true;
+    for (const h of s.hunks) {
+      for (const b of h.body) {
+        if (b.kind === 'new') {
+          plus.push(b.text);
+          final = !b.backslashAfter;
+        }
+      }
+    }
+    tree.now.set(newP, plus.length === 0 ? '' : plus.join('\n') + (final ? '\n' : ''));
+    return;
+  }
+  // delete, move and change all edit the old file.
+  const file = oldP!;
+  const before = tree.get(file);
+  if (before === null) throw new Fail('missing', file);
+  if (kind === 'move' && newP !== null && tree.get(newP) !== null) throw new Fail('exists', newP);
+  if (kind === 'delete') {
+    // S6-20: a deletion's hunks are not read — the file is deleted regardless
+    // of whether its hunks would match (they are still parsed: a malformed
+    // `@@` line is a parse error before any edit runs, see A21).
+    tree.now.set(file, null);
+    return;
+  }
+  let state: { lines: string[]; br: '\r\n' | '\n'; final: boolean; d: number } = { ...splitFileLines(before), d: 0 };
+  try {
+    for (const h of s.hunks) {
+      state = applyUnifiedHunk(state, h, state.d, strict);
+    }
+  } catch (e) {
+    if (e instanceof Exit2 && e.line === 'error: no-match') throw new Fail('no-match', file);
+    throw e;
+  }
+  const after = joinFileLines(state.lines, state.br, state.final);
+  if (kind === 'move') {
+    const target = newP!;
+    tree.now.set(file, null);
+    tree.now.set(target, after);
+    tree.moves.push([file, target]);
+    return;
+  }
+  tree.now.set(file, after);
+}
+
 // M2 — matcher 3 tier + primitif baris/file (SPEC sections 3 and 5).
 // Not wired to the CLI yet: no format uses these until M3. The CLI behaviour
 // below is unchanged by this section.
@@ -167,6 +511,8 @@ export function applyReplacement(
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
+  /** Moves recorded by unified move edits, as [old, new] pairs (S6-22). */
+  readonly moves: [string, string][] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -315,7 +661,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
@@ -336,18 +682,42 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   const rows: string[] = [];
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+  // One entry per changed file; a move that qualifies is one R row sorted by
+  // its new path and counts as one file (S6-22), replacing the D row of the
+  // old path and the A row of the new path (their writes are kept).
+  const entries: { key: string; row: string; write: () => void }[] = [];
+  for (const p of [...tree.now.keys()]) {
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+    entries.push({
+      key: p,
+      row: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`,
+      write: () => {
+        if (check) return;
+        if (now === null) rmSync(p, { force: true });
+        else {
+          mkdirSync(dirname(p), { recursive: true });
+          writeFileSync(p, now);
+        }
+      },
+    });
+  }
+  for (const [o, n] of tree.moves) {
+    // A recorded move qualifies only when the old file existed before and
+    // does not after, and the new file did not exist before and does after.
+    if (tree.original(o) !== null && tree.get(o) === null && tree.original(n) === null && tree.get(n) !== null) {
+      const doomed = entries.filter((e) => e.key === o || e.key === n);
+      const writes = doomed.map((e) => e.write);
+      for (let k = entries.length - 1; k >= 0; k--) {
+        if (entries[k]!.key === o || entries[k]!.key === n) entries.splice(k, 1);
+      }
+      entries.push({ key: n, row: `R ${o} -> ${n}`, write: () => { for (const w of writes) w(); } });
     }
   }
+  entries.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+  for (const e of entries) rows.push(e.row);
+  for (const e of entries) e.write();
   return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
 }
 
