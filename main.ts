@@ -1,8 +1,8 @@
-// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 4, 9 and 10 of SPEC.md: the command line, the output and
-// exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. The other three formats are
-// detected and then read as holding no edit, so they answer `error: parse 1`: reading unified diffs (section 6),
-// SEARCH/REPLACE blocks (section 7) and V4A patches (section 8), and matching lines at three tiers (section 5), are
-// yours to write. Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
+// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 7, 9 and 10 of SPEC.md: the command line, the output and
+// exit codes, safe paths, format detection, matching lines at three tiers (section 5), unified diffs (section 6),
+// SEARCH/REPLACE blocks (section 7), JSON edits and the all-or-nothing write. The remaining format is detected and
+// then read as holding no edit, so it answers `error: parse 1`: reading V4A patches (section 8) is yours to write.
+// Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
@@ -385,9 +385,119 @@ function unifiedSectionEdit(tree: Tree, s: UnifiedSection, strict: boolean): voi
   tree.now.set(file, after);
 }
 
+// ---------------------------------------------------------------------------
+// M3b — SEARCH/REPLACE blocks (SPEC section 7): parser + applier.
+// ---------------------------------------------------------------------------
+
+/** One SEARCH/REPLACE block (S7-01): its SEARCH line number (1-based), its path, and its old/new lines. */
+export interface SearchReplaceBlock {
+  searchLine: number;
+  path: string;
+  oldLines: string[];
+  newLines: string[];
+}
+
+const SR_SEARCH = '<<<<<<< SEARCH';
+const SR_SEP = '=======';
+const SR_REPLACE = '>>>>>>> REPLACE';
+/** A marker line (S7-02): matched with its trailing whitespace removed — leading whitespace does not match. */
+const isMarker = (l: string, m: string): boolean => l.trimEnd() === m;
+
+/**
+ * Parse SEARCH/REPLACE blocks (S7-01..S7-06). Throws Exit2 on parse errors.
+ * Path (S7-03): the nearest line before the SEARCH line, after the previous
+ * block's REPLACE line (or the start of the patch), that is not blank and,
+ * its surrounding whitespace removed, does not start with three backticks;
+ * the path is that line with its surrounding whitespace removed. No such
+ * line: the previous block's path, or `error: parse <SEARCH line>` for the
+ * first block (S7-04). A SEARCH line with no `=======` and then `>>>>>>> REPLACE`
+ * after it is `error: parse <SEARCH line>` (S7-05) — read literally: the
+ * scan for either marker runs to the end of the patch, so a `=======` with
+ * no `>>>>>>> REPLACE` after it, and a SEARCH line met while scanning, are
+ * the same error (see B1/B2). Lines outside blocks are ignored (S7-06).
+ */
+export function parseSearchReplace(lines: string[]): SearchReplaceBlock[] {
+  const blocks: SearchReplaceBlock[] = [];
+  let prevPath: string | null = null;
+  let prevReplaceEnd = -1; // index of the previous block's REPLACE line (-1: start of the patch)
+  let i = 0;
+  while (i < lines.length) {
+    if (!isMarker(lines[i]!, SR_SEARCH)) {
+      i++;
+      continue;
+    }
+    const searchLine = i + 1;
+    let path: string | null = null;
+    for (let j = i - 1; j > prevReplaceEnd; j--) {
+      const t = lines[j]!.trim();
+      if (t === '' || t.startsWith('```')) continue;
+      path = t;
+      break;
+    }
+    if (path === null) {
+      if (prevPath === null) throw new Exit2(`error: parse ${searchLine}`);
+      path = prevPath;
+    }
+    let sep = -1;
+    for (let k = i + 1; k < lines.length; k++) {
+      if (isMarker(lines[k]!, SR_SEP)) {
+        sep = k;
+        break;
+      }
+    }
+    if (sep === -1) throw new Exit2(`error: parse ${searchLine}`);
+    let end = -1;
+    for (let k = sep + 1; k < lines.length; k++) {
+      if (isMarker(lines[k]!, SR_REPLACE)) {
+        end = k;
+        break;
+      }
+    }
+    if (end === -1) throw new Exit2(`error: parse ${searchLine}`);
+    blocks.push({ searchLine, path, oldLines: lines.slice(i + 1, sep), newLines: lines.slice(sep + 1, end) });
+    prevPath = path;
+    prevReplaceEnd = end;
+    i = end + 1;
+  }
+  return blocks;
+}
+
+/**
+ * Build one Edit per block (S7-07): each block is one edit, applied in
+ * order; a block that fails leaves the tree untouched (run() also snapshots
+ * per edit, S10-02).
+ */
+export function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
+  const blocks = parseSearchReplace(lines);
+  return blocks.map((b) => (tree) => searchReplaceBlockEdit(tree, b, strict));
+}
+
+function searchReplaceBlockEdit(tree: Tree, b: SearchReplaceBlock, strict: boolean): void {
+  // Safety first (S10-02): the path is checked before the file is looked at.
+  if (!safe(b.path)) throw new Fail('unsafe', b.path);
+  if (b.oldLines.length === 0) {
+    // S7-08: the file is created with the new lines (LF breaks, final break
+    // — S3; an empty new-lines list creates an empty file).
+    if (tree.get(b.path) !== null) throw new Fail('exists', b.path);
+    tree.now.set(b.path, b.newLines.length === 0 ? '' : b.newLines.join('\n') + '\n');
+    return;
+  }
+  const before = tree.get(b.path);
+  if (before === null) throw new Fail('missing', b.path);
+  const state = splitFileLines(before);
+  const occ = findOccurrences(b.oldLines, state.lines, strict);
+  if (occ === null) throw new Fail('no-match', b.path);
+  if (occ.positions.length > 1) throw new Fail('ambiguous', b.path);
+  // SEARCH/REPLACE blocks have no context lines: every line of N is new.
+  // Tier-2 re-indent is literal (A16), via applyReplacement (S5-11, S5-12).
+  const contextOf = b.newLines.map(() => null);
+  const newLines = applyReplacement(state.lines, occ.positions[0]!, b.oldLines, b.newLines, occ.tier, contextOf, 'literal');
+  tree.now.set(b.path, joinFileLines(newLines, state.br, state.final));
+}
+
 // M2 — matcher 3 tier + primitif baris/file (SPEC sections 3 and 5).
-// Not wired to the CLI yet: no format uses these until M3. The CLI behaviour
-// below is unchanged by this section.
+// Wired to the CLI by M3a (unified) and M3b (SEARCH/REPLACE); the V4A
+// format (M3c) will use them too.
 // ---------------------------------------------------------------------------
 
 /** A file's line break (S3-04): CRLF when its first line feed follows a carriage return, LF otherwise. */
@@ -661,7 +771,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
