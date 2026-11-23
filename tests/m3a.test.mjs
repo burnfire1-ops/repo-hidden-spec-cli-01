@@ -633,3 +633,12 @@ test('cli: deletion hunks are not read, non-matching hunk still deletes (S6-20)'
   assert.equal(r.out, 'D x.txt\nok: 1 file\n');
   assert.equal(r.exists('x.txt'), false);
 });
+
+test('cli: created file ends without a break when backslash follows its last + line (S6-30)', () => {
+  const r = cli(
+    {},
+    '--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n\\ No newline at end of file\n',
+  );
+  assert.equal(r.code, 0);
+  assert.equal(r.read('n.txt'), 'one\ntwo');
+});
