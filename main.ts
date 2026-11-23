@@ -1,7 +1,6 @@
-// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 7, 9 and 10 of SPEC.md: the command line, the output and
+// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 10 of SPEC.md: the command line, the output and
 // exit codes, safe paths, format detection, matching lines at three tiers (section 5), unified diffs (section 6),
-// SEARCH/REPLACE blocks (section 7), JSON edits and the all-or-nothing write. The remaining format is detected and
-// then read as holding no edit, so it answers `error: parse 1`: reading V4A patches (section 8) is yours to write.
+// SEARCH/REPLACE blocks (section 7), V4A patches (section 8), JSON edits and the all-or-nothing write.
 // Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
@@ -495,9 +494,371 @@ function searchReplaceBlockEdit(tree: Tree, b: SearchReplaceBlock, strict: boole
   tree.now.set(b.path, joinFileLines(newLines, state.br, state.final));
 }
 
+// ---------------------------------------------------------------------------
+// M3c — V4A patches (SPEC section 8): parser + applier.
+// ---------------------------------------------------------------------------
+
+/** One body line of a V4A chunk (S8-11): context, old, or new. */
+export interface V4aBodyLine {
+  kind: 'context' | 'old' | 'new';
+  text: string;
+  /** Internal: this line came from a truly blank patch line (S8-03 strip). */
+  fromBlank?: boolean;
+}
+
+/** One chunk of an Update File section (S8-10, S8-12). */
+export interface V4aChunk {
+  /** The chunk's anchor, or null for no anchor (S8-10: empty @@ text). */
+  anchor: string | null;
+  body: V4aBodyLine[];
+  /** True when the chunk was ended by `*** End of File` (S8-12). */
+  eof: boolean;
+}
+
+/** One section of a V4A patch (S8-01, S8-04). */
+export interface V4aSection {
+  kind: 'add' | 'delete' | 'update';
+  path: string;
+  /** Add File: the file's lines (S8-07). */
+  lines: string[];
+  /** Update File: the new path, or null (S8-09). */
+  moveTo: string | null;
+  /** Update File: its chunks, in order (S8-14). */
+  chunks: V4aChunk[];
+  /** Update File: the 1-based line of its header (S8-13 error). */
+  updateLine: number;
+}
+
+const V4A_BEGIN = '*** Begin Patch';
+const V4A_END = '*** End Patch';
+const V4A_ADD = '*** Add File: ';
+const V4A_DELETE = '*** Delete File: ';
+const V4A_UPDATE = '*** Update File: ';
+const V4A_MOVE_TO = '*** Move to: ';
+const V4A_END_OF_FILE = '*** End of File';
+
+/** The section kind a line starts, or null (S8-04). The prefix includes its trailing space (see C1). */
+function v4aSectionStart(line: string): 'add' | 'delete' | 'update' | null {
+  if (line.startsWith(V4A_ADD)) return 'add';
+  if (line.startsWith(V4A_DELETE)) return 'delete';
+  if (line.startsWith(V4A_UPDATE)) return 'update';
+  return null;
+}
+
+/**
+ * Parse an Add File section starting at lines[i] (S8-03, S8-07). Returns the
+ * file's lines and the index of the next section-start line or `last` (the
+ * End Patch line). A `+` line is a file line (its rest, even when empty); a
+ * truly blank patch line is an empty file line. Blank patch lines at the end
+ * of the section are not part of it (S8-03) — a trailing `+` line is not a
+ * blank patch line and is kept (see C7).
+ */
+function parseV4aAdd(lines: string[], i: number, last: number): { fileLines: string[]; next: number } {
+  const collected: { text: string; fromBlank: boolean }[] = [];
+  while (i < last) {
+    const l = lines[i]!;
+    if (v4aSectionStart(l) !== null) break;
+    if (l.startsWith('+')) {
+      collected.push({ text: l.slice(1), fromBlank: false });
+      i++;
+      continue;
+    }
+    if (blank(l)) {
+      // A whitespace-only line is an empty file line (S8-07 "are empty",
+      // read as blank() like S8-03/S8-05); trailing ones are stripped below.
+      collected.push({ text: '', fromBlank: true });
+      i++;
+      continue;
+    }
+    throw new Exit2(`error: parse ${i + 1}`);
+  }
+  while (collected.length > 0 && collected[collected.length - 1]!.fromBlank) collected.pop();
+  return { fileLines: collected.map((c) => c.text), next: i };
+}
+
+/**
+ * Parse an Update File section starting at lines[i] (S8-09..S8-13). Returns
+ * the section and the index of the next section-start line or `last`.
+ * Blank lines are ignored when no chunk is open (C2: before the first chunk,
+ * after `*** End of File`, after the header); inside a chunk they are empty
+ * context lines, except at the end of the section (S8-03).
+ */
+function parseV4aUpdate(lines: string[], i: number, last: number, updateLine: number): { section: V4aSection; next: number } {
+  const path = lines[i]!.slice(V4A_UPDATE.length).trim();
+  i++;
+  // Optional `*** Move to:` as the first (non-blank) line (S8-09).
+  let moveTo: string | null = null;
+  while (i < last && blank(lines[i]!)) i++;
+  if (i < last && lines[i]!.startsWith(V4A_MOVE_TO)) {
+    moveTo = lines[i]!.slice(V4A_MOVE_TO.length).trim();
+    i++;
+  }
+  const chunks: V4aChunk[] = [];
+  // Chunk state machine: 'start' (no chunk yet), 'chunk' (one open),
+  // 'afterEof' (a chunk just ended at *** End of File).
+  let state: 'start' | 'chunk' | 'afterEof' = 'start';
+  let cur: V4aChunk | null = null;
+  const closeChunk = (): void => {
+    if (cur !== null) {
+      chunks.push(cur);
+      cur = null;
+    }
+  };
+  const stripTrailingBlanks = (chunk: V4aChunk): void => {
+    while (chunk.body.length > 0 && chunk.body[chunk.body.length - 1]!.fromBlank) chunk.body.pop();
+  };
+  const bodyLine = (l: string): V4aBodyLine | null => {
+    if (l === '') return { kind: 'context', text: '', fromBlank: true };
+    // A whitespace-only line is an empty context line; fromBlank marks it
+    // for the S8-03 strip at the end of the section (v-cursor proof: a
+    // trailing ` ` line is stripped, so "blank" is blank(), not zero-length).
+    if (l[0] === ' ') return { kind: 'context', text: l.slice(1), fromBlank: blank(l) };
+    if (l[0] === '-') return { kind: 'old', text: l.slice(1) };
+    if (l[0] === '+') return { kind: 'new', text: l.slice(1) };
+    return null;
+  };
+  while (i < last) {
+    const l = lines[i]!;
+    const n = i + 1;
+    if (v4aSectionStart(l) !== null) {
+      if (state === 'chunk' && cur !== null) {
+        stripTrailingBlanks(cur);
+        closeChunk();
+      }
+      break;
+    }
+    if (state === 'start') {
+      if (blank(l)) {
+        i++;
+        continue;
+      }
+      if (l.startsWith('@@')) {
+        cur = { anchor: l.slice(2).trim() || null, body: [], eof: false };
+        state = 'chunk';
+        i++;
+        continue;
+      }
+      const b = bodyLine(l);
+      if (b !== null) {
+        cur = { anchor: null, body: [b], eof: false };
+        state = 'chunk';
+        i++;
+        continue;
+      }
+      throw new Exit2(`error: parse ${n}`);
+    }
+    if (state === 'chunk') {
+      if (l === V4A_END_OF_FILE) {
+        cur!.eof = true;
+        closeChunk();
+        state = 'afterEof';
+        i++;
+        continue;
+      }
+      if (l.startsWith('@@')) {
+        closeChunk();
+        cur = { anchor: l.slice(2).trim() || null, body: [], eof: false };
+        i++;
+        continue;
+      }
+      const b = bodyLine(l);
+      if (b !== null) {
+        cur!.body.push(b);
+        i++;
+        continue;
+      }
+      throw new Exit2(`error: parse ${n}`);
+    }
+    // state === 'afterEof'
+    if (blank(l)) {
+      i++;
+      continue;
+    }
+    if (l.startsWith('@@')) {
+      cur = { anchor: l.slice(2).trim() || null, body: [], eof: false };
+      state = 'chunk';
+      i++;
+      continue;
+    }
+    throw new Exit2(`error: parse ${n}`);
+  }
+  if (state === 'chunk' && cur !== null) {
+    // The section ended at End Patch (i === last): strip trailing blanks.
+    stripTrailingBlanks(cur);
+    closeChunk();
+  }
+  if (chunks.length === 0 && moveTo === null) throw new Exit2(`error: parse ${updateLine}`);
+  return { section: { kind: 'update', path, lines: [], moveTo, chunks, updateLine }, next: i };
+}
+
+/**
+ * Parse a V4A patch into sections (S8-01..S8-13). Throws Exit2 on parse
+ * errors, with the 1-based line the format's section names. The first
+ * non-blank line is `*** Begin Patch` and the last non-blank line is
+ * `*** End Patch`, both compared with surrounding whitespace removed (S8-02).
+ */
+export function parseV4a(lines: string[]): V4aSection[] {
+  const first = lines.findIndex((l) => !blank(l));
+  if (first < 0) throw new Exit2('error: parse 1');
+  if (lines[first]!.trim() !== V4A_BEGIN) throw new Exit2(`error: parse ${first + 1}`);
+  let last = -1;
+  for (let k = lines.length - 1; k >= 0; k--) {
+    if (!blank(lines[k]!)) {
+      last = k;
+      break;
+    }
+  }
+  if (lines[last]!.trim() !== V4A_END) throw new Exit2(`error: parse ${lines.length + 1}`);
+  const sections: V4aSection[] = [];
+  let i = first + 1;
+  while (i < last) {
+    const l = lines[i]!;
+    const n = i + 1;
+    if (blank(l)) {
+      i++;
+      continue;
+    }
+    const start = v4aSectionStart(l);
+    if (start === null) throw new Exit2(`error: parse ${n}`);
+    if (start === 'add') {
+      const path = l.slice(V4A_ADD.length).trim();
+      const { fileLines, next } = parseV4aAdd(lines, i + 1, last);
+      sections.push({ kind: 'add', path, lines: fileLines, moveTo: null, chunks: [], updateLine: 0 });
+      i = next;
+      continue;
+    }
+    if (start === 'delete') {
+      const path = l.slice(V4A_DELETE.length).trim();
+      sections.push({ kind: 'delete', path, lines: [], moveTo: null, chunks: [], updateLine: 0 });
+      i++;
+      continue;
+    }
+    const { section, next } = parseV4aUpdate(lines, i, last, n);
+    sections.push(section);
+    i = next;
+  }
+  return sections;
+}
+
+/**
+ * Build one Edit per section (S8-14): each section is one edit, applied in
+ * order; a section that fails leaves the tree untouched (run() also
+ * snapshots per edit, S10-02).
+ */
+export function v4aEdits(lines: string[], strict: boolean): Edit[] {
+  const sections = parseV4a(lines);
+  return sections.map((s) => (tree) => v4aSectionEdit(tree, s, strict));
+}
+
+/** O and N of a chunk, with N's context alignment (S8-20): O = context + `-` lines, N = context + `+` lines; contextOf[k] is the index into O of N[k] when N[k] is a context line, null when N[k] is a `+` line. */
+function v4aChunkON(chunk: V4aChunk): { O: string[]; N: string[]; contextOf: (number | null)[] } {
+  const O: string[] = [];
+  const N: string[] = [];
+  const contextOf: (number | null)[] = [];
+  for (const b of chunk.body) {
+    if (b.kind === 'context') {
+      contextOf.push(O.length);
+      O.push(b.text);
+      N.push(b.text);
+    } else if (b.kind === 'old') {
+      O.push(b.text);
+    } else {
+      N.push(b.text);
+      contextOf.push(null);
+    }
+  }
+  return { O, N, contextOf };
+}
+
+/**
+ * Apply one chunk to a file's lines at the cursor (S8-18..S8-23). An
+ * anchored chunk first finds the first line at or after the cursor equal to
+ * the anchor at the first tier where one is (S8-19), and the cursor moves
+ * past it; no anchor match is a no-match — thrown as `error: no-match`
+ * without a path, the caller (section edit) adds the path. The chunk takes
+ * the first occurrence of O at or after the cursor, at the first tier with
+ * one (S8-21); an end-of-file chunk takes only an occurrence that ends at
+ * the file's last line. When O is empty, N is inserted at the cursor, or at
+ * the end of the file for an end-of-file chunk (S8-22). The cursor then
+ * moves to just after the lines written (S8-23). The file's final break is
+ * unchanged (section 8 has no `\` rule). Context lines are written as the
+ * file's own lines and tier-2 re-indent is literal (A16), both via
+ * applyReplacement (S5-11, S5-12). For an insertion there is no match, hence
+ * no tier: `+` lines are written as they are.
+ */
+function applyV4aChunk(
+  state: { lines: string[]; br: '\r\n' | '\n'; final: boolean; cursor: number },
+  chunk: V4aChunk,
+  strict: boolean,
+): { lines: string[]; br: '\r\n' | '\n'; final: boolean; cursor: number } {
+  const { lines, br, final } = state;
+  let cursor = state.cursor;
+  if (chunk.anchor !== null) {
+    const aocc = findOccurrences([chunk.anchor], lines.slice(cursor), strict);
+    if (aocc === null) throw new Exit2('error: no-match');
+    cursor += aocc.positions[0]! + 1;
+  }
+  const { O, N, contextOf } = v4aChunkON(chunk);
+  if (O.length > 0) {
+    const occ = findOccurrences(O, lines.slice(cursor), strict);
+    if (occ === null) throw new Exit2('error: no-match');
+    let rel = occ.positions[0]!;
+    if (chunk.eof) {
+      // Only an occurrence ending at the file's last line counts (S8-21).
+      const atEnd = occ.positions.find((p) => cursor + p + O.length === lines.length);
+      if (atEnd === undefined) throw new Exit2('error: no-match');
+      rel = atEnd;
+    }
+    const pos = cursor + rel;
+    const newLines = applyReplacement(lines, pos, O, N, occ.tier, contextOf, 'literal');
+    return { lines: newLines, br, final, cursor: pos + N.length };
+  }
+  const pos = chunk.eof ? lines.length : cursor;
+  const newLines = applyReplacement(lines, pos, [], N, 0, contextOf, 'literal');
+  return { lines: newLines, br, final, cursor: pos + N.length };
+}
+
+function v4aSectionEdit(tree: Tree, s: V4aSection, strict: boolean): void {
+  // Safety first (S10-02): named paths are checked before existence checks.
+  if (!safe(s.path)) throw new Fail('unsafe', s.path);
+  if (s.kind === 'update' && s.moveTo !== null && !safe(s.moveTo)) throw new Fail('unsafe', s.moveTo);
+  if (s.kind === 'add') {
+    if (tree.get(s.path) !== null) throw new Fail('exists', s.path);
+    // S8-15: the file is the section's lines, ended by a line break; an
+    // empty section creates an empty file (see C3).
+    tree.now.set(s.path, s.lines.length === 0 ? '' : s.lines.join('\n') + '\n');
+    return;
+  }
+  const before = tree.get(s.path);
+  if (before === null) throw new Fail('missing', s.path);
+  if (s.kind === 'delete') {
+    tree.now.set(s.path, null);
+    return;
+  }
+  // update
+  if (s.moveTo !== null && tree.get(s.moveTo) !== null) throw new Fail('exists', s.moveTo);
+  let state: { lines: string[]; br: '\r\n' | '\n'; final: boolean; cursor: number } = { ...splitFileLines(before), cursor: 0 };
+  try {
+    for (const ch of s.chunks) {
+      state = applyV4aChunk(state, ch, strict);
+    }
+  } catch (e) {
+    if (e instanceof Exit2 && e.line === 'error: no-match') throw new Fail('no-match', s.path);
+    throw e;
+  }
+  const after = joinFileLines(state.lines, state.br, state.final);
+  if (s.moveTo !== null) {
+    tree.now.set(s.path, null);
+    tree.now.set(s.moveTo, after);
+    tree.moves.push([s.path, s.moveTo]);
+    return;
+  }
+  tree.now.set(s.path, after);
+}
+
 // M2 — matcher 3 tier + primitif baris/file (SPEC sections 3 and 5).
 // Wired to the CLI by M3a (unified) and M3b (SEARCH/REPLACE); the V4A
-// format (M3c) will use them too.
+// format (M3c) uses them too.
 // ---------------------------------------------------------------------------
 
 /** A file's line break (S3-04): CRLF when its first line feed follows a carriage return, LF otherwise. */
@@ -771,7 +1132,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : kind === 'v4a' ? v4aEdits(lines, strict) : [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
